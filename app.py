@@ -118,11 +118,19 @@ monthly = (
 )
 monthly["Cumulative"] = monthly["Volume"].cumsum()
 
+
 issuer = (
     df.groupby("Issuer", as_index=False)
-    .agg(Volume=("Volume", "sum"), Fees=("Fee $", "sum"), Avg_Fee=("Fee", "mean"), Trades=("Note", "count"))
-    .sort_values("Volume", ascending=False)
+    .agg(
+        Volume=("Volume", "sum"),
+        Fees=("Fee $", "sum"),
+        Trades=("Note", "count"),
+    )
 )
+
+issuer["Avg_Fee"] = issuer["Fees"] / issuer["Volume"]
+issuer = issuer.sort_values("Volume", ascending=False)
+
 
 structure = (
     df.groupby("Structure Type", as_index=False)
@@ -148,7 +156,7 @@ total_volume = df["Volume"].sum()
 total_trades = df["Note"].count()
 total_fees = df["Fee $"].sum()
 avg_trade_size = df["Volume"].mean()
-avg_fee_rate = df["Fee"].mean()
+avg_fee_rate = df["Fee $"].sum() / df["Volume"].sum()
 
 date_min = df["Trade Date"].min()
 date_max = df["Trade Date"].max()
@@ -276,7 +284,7 @@ for cat in ["Banker", "Investor", "Investments", "Calendar"]:
 fig_steerco.update_layout(barmode="stack")
 fig_steerco.update_yaxes(title="Volume ($M)", showgrid=True, gridcolor=GRID, zeroline=False, color=GRAY)
 fig_steerco.update_xaxes(color=GRAY)
-base_layout(fig_steerco, "\u25c6 Monthly Volume by Steerco Attribution")
+base_layout(fig_steerco, "\u25c6 Monthly Volume by Sponsor")
 
 
 # 5) Top 10 largest trades by volume
@@ -454,7 +462,7 @@ app.layout = html.Div(
             [
                 html.Div(style={"height": "4px", "width": "70%", "margin": "18px auto 14px auto", "backgroundColor": BRADESCO_RED, "borderRadius": "999px"}),
                 html.Div(
-                    "Portfolio Solutions | Data as of May 15, 2026 | Confidential",
+                    "Portfolio Solutions | Data as of May 21, 2026 | Confidential",
                     style={"textAlign": "center", "fontSize": "13px", "color": GRAY, "fontStyle": "italic"},
                 ),
             ]
