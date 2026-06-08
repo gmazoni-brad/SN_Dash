@@ -49,6 +49,9 @@ STEERCO_COLORS = {
     "Calendar": "#F472B6",
 }
 
+from datetime import datetime
+today = datetime.now().strftime("%B %d, %Y")  # Ex: "May 27, 2026"
+
 
 # ============================================================
 # LOAD + PREP DATA
@@ -91,6 +94,10 @@ def pct(x):
 def load_data(path):
     df = pd.read_excel(path, engine="openpyxl")
     df["Trade Date"] = pd.to_datetime(df["Trade Date"], errors="coerce")
+    
+    # Clean whitespace from string columns
+    df["Sub Asset Class"] = df["Sub Asset Class"].str.strip()
+
     if "Settle Date" in df.columns:
         df["Settle Date"] = pd.to_datetime(df["Settle Date"], errors="coerce")
     df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
@@ -151,6 +158,20 @@ issuer_structure = df.groupby(["Issuer", "Structure Type"], as_index=False)["Vol
 top_structures = structure["Structure Type"].head(5).tolist()
 issuer_structure_top = issuer_structure[issuer_structure["Structure Type"].isin(top_structures)].copy()
 
+# Sub Asset Class breakdown
+sub_asset = (
+    df.groupby("Sub Asset Class", as_index=False)
+    .agg(
+        Volume=("Volume", "sum"),
+        Trades=("Note", "count"),
+        Fees=("Fee $", "sum"),
+    )
+    .sort_values("Volume", ascending=False)
+)
+
+sub_asset["Avg_Fee"] = sub_asset["Fees"] / sub_asset["Volume"]
+sub_asset["Pct"] = sub_asset["Volume"] / sub_asset["Volume"].sum() * 100
+
 # KPIs
 total_volume = df["Volume"].sum()
 total_trades = df["Note"].count()
@@ -161,6 +182,9 @@ avg_fee_rate = df["Fee $"].sum() / df["Volume"].sum()
 date_min = df["Trade Date"].min()
 date_max = df["Trade Date"].max()
 date_range_label = f"{date_min.strftime('%B')} \u2014 {date_max.strftime('%B %Y')} | Year-to-Date Performance"
+
+
+
 
 
 # ============================================================
@@ -178,7 +202,124 @@ def base_layout(fig, title=None):
     )
     return fig
 
+# ============================================================
+# UNDERLYING CONCENTRATION (reads from Excel columns)
+# ============================================================
+und_cols = ["Underlying 1", "Underlying 2", "Underlying 3"]
 
+rows = []
+for _, trade in df.iterrows():
+    for col in und_cols:
+        if col in df.columns:
+            val = trade.get(col)
+            if pd.notna(val) and str(val).strip():
+                rows.append({
+                    "Underlying": str(val).strip(),
+                    "Volume": trade["Volume"],
+                })
+
+und_df = pd.DataFrame(rows)
+
+underlying = (
+    und_df.groupby("Underlying", as_index=False)
+    .agg(
+        Appearances=("Volume", "count"),
+        Total_Volume=("Volume", "sum"),
+    )
+    .sort_values("Total_Volume", ascending=False)
+)
+underlying["Pct"] = underlying["Total_Volume"] / underlying["Total_Volume"].sum() * 100
+underlying["Cumulative_Pct"] = underlying["Pct"].cumsum()
+
+top5_concentration = underlying.head(5)["Pct"].sum()
+n_underlyings = len(underlying)
+
+# --- Top 10 Bar Chart ---
+top_und = underlying.head(10).sort_values("Total_Volume", ascending=True)
+
+max_vol = top_und["Total_Volume"].max()
+bar_colors = [
+    f"rgba(88, 166, 255, {0.4 + 0.6 * (v / max_vol)})"
+    for v in top_und["Total_Volume"]
+]
+
+fig_underlying = go.Figure(
+    go.Bar(
+        x=top_und["Total_Volume"] / 1_000_000,
+        y=top_und["Underlying"],
+        orientation="h",
+        marker=dict(color=bar_colors, line=dict(color=PANEL_BG, width=1.5)),
+        text=[
+            f"  {money_m(v)}  \u00b7  {int(a)} trades  \u00b7  {p:.1f}%"
+            for v, a, p in zip(top_und["Total_Volume"], top_und["Appearances"], top_und["Pct"])
+        ],
+        textposition="outside",
+        textfont=dict(size=12, color=WHITE),
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "Volume: $%{x:.2f}M<br>"
+            "Trades: %{customdata[0]}<br>"
+            "Share: %{customdata[1]:.1f}%<br>"
+            "Cumulative: %{customdata[2]:.1f}%"
+            "<extra></extra>"
+        ),
+        customdata=np.stack(
+            [top_und["Appearances"], top_und["Pct"], top_und["Cumulative_Pct"]],
+            axis=-1,
+        ),
+    )
+)
+
+fig_underlying.update_yaxes(color=WHITE, tickfont=dict(size=13, color=WHITE))
+fig_underlying.update_xaxes(title="Volume ($M)", showgrid=True, gridcolor=GRID, zeroline=False, color=GRAY)
+fig_underlying.update_layout(height=450, margin=dict(l=120, r=200, t=70, b=40))
+base_layout(fig_underlying, "\u25c6 Top 10 Underlyings by Exposure")
+
+
+# --- Donut: Top 10 vs Others ---
+top10_vol = underlying.head(10)["Total_Volume"].sum()
+others_vol = underlying.iloc[10:]["Total_Volume"].sum()
+
+donut_labels = underlying.head(10)["Underlying"].tolist() + ["Others"]
+donut_values = underlying.head(10)["Total_Volume"].tolist() + [others_vol]
+donut_colors = [
+    LIGHT_BLUE, TEAL, GOLD, SOFT_PURPLE, BRADESCO_RED,
+    "#79C0FF", "#56D364", "#FFA657", "#FF7B72", "#D2A8FF", GRAY,
+]
+
+fig_und_donut = go.Figure(
+    data=[
+        go.Pie(
+            labels=donut_labels,
+            values=donut_values,
+            hole=0.58,
+            marker=dict(
+                colors=donut_colors[:len(donut_labels)],
+                line=dict(color=PANEL_BG, width=3),
+            ),
+            textinfo="percent",
+            textfont=dict(size=11, color=WHITE),
+            hovertemplate="<b>%{label}</b><br>Volume: $%{value:,.0f}<br>Share: %{percent}<extra></extra>",
+        )
+    ]
+)
+
+fig_und_donut.add_annotation(
+    text=f"<b>{n_underlyings}</b><br><span style='font-size:12px;color:{GRAY}'>Underlyings</span>",
+    x=0.5, y=0.5, showarrow=False, font=dict(color=WHITE, size=24),
+)
+
+fig_und_donut.update_layout(
+    height=450,
+    legend=dict(
+        font=dict(size=11, color=WHITE),
+        bgcolor="rgba(0,0,0,0)",
+        orientation="v",
+        yanchor="middle", y=0.5,
+        xanchor="left", x=1.05,
+    ),
+)
+base_layout(fig_und_donut, "\u25c6 Underlying Concentration Mix")
 # ============================================================
 # FIGURES
 # ============================================================
@@ -333,6 +474,60 @@ base_layout(fig_fee, "\u25c6 Average Fee Rate by Issuer")
 # 7) Grouped Bar: Volume by Issuer & Structure Type  --- FIXED: reindex only Volume series
 fig_issuer_structure = go.Figure()
 
+# 8) Sub Asset Class Breakdown — Horizontal Bar
+sub_asset_sorted = sub_asset.sort_values("Volume", ascending=True).copy()
+
+SUB_ASSET_COLORS = {
+    "US Equities": "#58A6FF",
+    "Emerging Markets Bonds": "#2DD4BF",
+    "Emerging Markets Equities": "#2DD4BF",
+    "Global Fixed Income": "#F0B429",
+    "Commodities": "#A78BFA",
+    "Investment Grade": "#FF7B72",
+    "High Yield": "#79C0FF",
+}
+
+fig_sub_asset = go.Figure(
+    go.Bar(
+        x=sub_asset_sorted["Volume"] / 1_000_000,
+        y=sub_asset_sorted["Sub Asset Class"],
+        orientation="h",
+        marker=dict(
+            color=[SUB_ASSET_COLORS.get(s, GRAY) for s in sub_asset_sorted["Sub Asset Class"]],
+            line=dict(color=PANEL_BG, width=1.5),
+        ),
+        text=[
+            f"{money_m(v)}  ·  {t} trades  ·  {p:.1f}%"
+            for v, t, p in zip(
+                sub_asset_sorted["Volume"],
+                sub_asset_sorted["Trades"],
+                sub_asset_sorted["Pct"],
+            )
+        ],
+        textposition="outside",
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "Volume: %{x:.2f}M<br>"
+            "Trades: %{customdata[0]}<br>"
+            "Avg Fee: %{customdata[1]:.2f}%<br>"
+            "<extra></extra>"
+        ),
+        customdata=np.stack(
+            [sub_asset_sorted["Trades"], sub_asset_sorted["Avg_Fee"] * 100],
+            axis=-1,
+        ),
+    )
+)
+
+fig_sub_asset.update_yaxes(color=WHITE)
+fig_sub_asset.update_xaxes(
+    title="Volume ($M)",
+    showgrid=True,
+    gridcolor=GRID,
+    zeroline=False,
+    color=GRAY,
+)
+base_layout(fig_sub_asset, "\u25c6 Volume by Sub Asset Class")
 for struct_name in top_structures:
     vol_series = (
         issuer_structure_top[issuer_structure_top["Structure Type"] == struct_name]
@@ -354,6 +549,102 @@ fig_issuer_structure.update_xaxes(color=WHITE)
 fig_issuer_structure.update_yaxes(title="Volume ($M)", showgrid=True, gridcolor=GRID, zeroline=False, color=GRAY)
 base_layout(fig_issuer_structure, "\u25c6 Volume by Issuer & Structure Type")
 
+
+fig_sub_asset.update_yaxes(color=WHITE)
+fig_sub_asset.update_xaxes(
+    title="Volume ($M)",
+    showgrid=True,
+    gridcolor=GRID,
+    zeroline=False,
+    color=GRAY,
+)
+base_layout(fig_sub_asset, "\u25c6 Volume by Sub Asset Class")
+
+# Donut: Sub Asset Class
+fig_sub_asset_donut = go.Figure(
+    data=[
+        go.Pie(
+            labels=sub_asset["Sub Asset Class"],
+            values=sub_asset["Volume"],
+            hole=0.58,
+            marker=dict(
+                colors=[SUB_ASSET_COLORS.get(s, GRAY) for s in sub_asset["Sub Asset Class"]],
+                line=dict(color=PANEL_BG, width=3),
+            ),
+            textinfo="percent",
+            hovertemplate="<b>%{label}</b><br>Volume: $%{value:,.0f}<br>Share: %{percent}<extra></extra>",
+        )
+    ]
+)
+fig_sub_asset_donut.add_annotation(
+    text=f"<b>{len(sub_asset)}</b><br><span style='font-size:12px;color:{GRAY}'>Sub Classes</span>",
+    x=0.5, y=0.5, showarrow=False, font=dict(color=WHITE, size=22),
+)
+base_layout(fig_sub_asset_donut, "\u25c6 Sub Asset Class Mix")
+
+
+# ============================================================
+# SANKEY: Issuer → Structure Type
+# ============================================================
+sankey_links = df.groupby(["Issuer", "Structure Type"], as_index=False)["Volume"].sum()
+sankey_links = sankey_links[sankey_links["Volume"] > 0]
+
+issuer_order = df.groupby("Issuer")["Volume"].sum().sort_values(ascending=False).index.tolist()
+struct_order = df.groupby("Structure Type")["Volume"].sum().sort_values(ascending=False).index.tolist()
+
+sankey_labels = issuer_order + struct_order
+sankey_idx = {label: i for i, label in enumerate(sankey_labels)}
+
+sankey_node_colors = []
+for label in sankey_labels:
+    if label in ISSUER_COLORS:
+        sankey_node_colors.append(ISSUER_COLORS[label])
+    elif label in STRUCTURE_COLORS:
+        sankey_node_colors.append(STRUCTURE_COLORS[label])
+    else:
+        sankey_node_colors.append(GRAY)
+
+sankey_node_vols = {}
+for _, row in df.iterrows():
+    for col in ["Issuer", "Structure Type"]:
+        sankey_node_vols[row[col]] = sankey_node_vols.get(row[col], 0) + row["Volume"]
+
+sankey_display = [
+    f"{label}  \u00b7  ${sankey_node_vols.get(label, 0)/1e6:.1f}M"
+    for label in sankey_labels
+]
+
+def hex_to_rgba(hex_color, alpha=0.45):
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r}, {g}, {b}, {alpha})"
+
+sk_src, sk_tgt, sk_val, sk_clr = [], [], [], []
+for _, row in sankey_links.iterrows():
+    sk_src.append(sankey_idx[row["Issuer"]])
+    sk_tgt.append(sankey_idx[row["Structure Type"]])
+    sk_val.append(row["Volume"])
+    sk_clr.append(hex_to_rgba(ISSUER_COLORS.get(row["Issuer"], GRAY)))
+
+fig_sankey = go.Figure(data=[go.Sankey(
+    arrangement="snap",
+    node=dict(
+        pad=30, thickness=35,
+        line=dict(color=PANEL_BG, width=2),
+        label=sankey_display,
+        color=sankey_node_colors,
+        hovertemplate="<b>%{label}</b><extra></extra>",
+    ),
+    link=dict(
+        source=sk_src, target=sk_tgt, value=sk_val, color=sk_clr,
+        hovertemplate="<b>%{source.label}</b> \u2192 <b>%{target.label}</b><br>Volume: $%{value:,.0f}<extra></extra>",
+    ),
+)])
+
+fig_sankey.update_layout(height=500, margin=dict(l=30, r=30, t=100, b=40))
+fig_sankey.add_annotation(x=0.0, y=1.10, text="<b>ISSUER</b>", showarrow=False, font=dict(size=16, color=GRAY), xref="paper", yref="paper")
+fig_sankey.add_annotation(x=1.0, y=1.10, text="<b>STRUCTURE TYPE</b>", showarrow=False, font=dict(size=16, color=GRAY), xref="paper", yref="paper")
+base_layout(fig_sankey, "\u25c6 Trade Flow: Issuer \u2192 Structure Type")
 
 # ============================================================
 # DASH APP
@@ -390,19 +681,42 @@ def kpi_card(title, value, accent):
                     "backgroundColor": accent,
                     "borderRadius": "999px",
                     "marginBottom": "14px",
-                }
+                },
+                className="accent-bar-glow",
             ),
-            html.Div(value, style={"fontSize": "30px", "fontWeight": "800", "color": WHITE, "marginBottom": "6px"}),
-            html.Div(title, style={"fontSize": "14px", "color": GRAY, "fontWeight": "600", "letterSpacing": "0.2px"}),
+            html.Div(
+                value,
+                style={
+                    "fontSize": "30px",
+                    "fontWeight": "800",
+                    "color": WHITE,
+                    "marginBottom": "6px",
+                },
+                className="kpi-value",
+            ),
+            html.Div(
+                title,
+                style={
+                    "fontSize": "14px",
+                    "color": GRAY,
+                    "fontWeight": "600",
+                    "letterSpacing": "0.2px",
+                },
+            ),
         ],
-        style=card_style,
+        className="glass-kpi kpi-animate",
+        style={
+            "padding": "18px 20px",
+            "flex": "1",
+            "minWidth": "180px",
+        },
     )
 
 
 app.layout = html.Div(
     style={"backgroundColor": BG, "minHeight": "100vh", "padding": "24px", "fontFamily": "Arial, sans-serif"},
     children=[
-        # Header
+# Header
         html.Div(
             [
                 html.Div(
@@ -417,8 +731,12 @@ app.layout = html.Div(
                     date_range_label,
                     style={"textAlign": "center", "fontSize": "14px", "color": GRAY, "marginTop": "8px", "marginBottom": "14px"},
                 ),
-                html.Div(style={"height": "4px", "width": "70%", "margin": "0 auto 28px auto", "backgroundColor": BRADESCO_RED, "borderRadius": "999px"}),
-            ]
+                html.Div(
+                    style={"height": "4px", "width": "70%", "margin": "0 auto 28px auto", "backgroundColor": BRADESCO_RED, "borderRadius": "999px"},
+                    className="header-line",
+                ),
+            ],
+            className="header-animate",
         ),
         # KPI Row
         html.Div(
@@ -428,6 +746,7 @@ app.layout = html.Div(
                 kpi_card("Fee Revenue", f"${total_fees / 1_000_000:.2f}M", GOLD),
                 kpi_card("Avg Trade Size", money_k(avg_trade_size), SOFT_PURPLE),
                 kpi_card("Avg Fee Rate", pct(avg_fee_rate), BRADESCO_RED),
+                kpi_card("Top 5 Concentration", f"{top5_concentration:.1f}%", SOFT_PINK),
             ],
             style={"display": "flex", "gap": "18px", "flexWrap": "wrap", "marginBottom": "24px"},
         ),
@@ -447,6 +766,9 @@ app.layout = html.Div(
             ],
             style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "20px", "marginBottom": "20px"},
         ),
+        
+
+
         # Row 3 - full width
         html.Div(dcc.Graph(figure=fig_top10, config={"displayModeBar": False}), style={**panel_style, "marginBottom": "20px"}),
         # Row 4
@@ -457,16 +779,70 @@ app.layout = html.Div(
             ],
             style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "20px", "marginBottom": "20px"},
         ),
-        # Footer
+        # Row 7 - Sankey (full width)
+        html.Div(
+            dcc.Graph(figure=fig_sankey, config={"displayModeBar": False}),
+            style={**panel_style, "marginBottom": "20px"},
+        ),
+        
+# Row 5 - Sub Asset Class
         html.Div(
             [
-                html.Div(style={"height": "4px", "width": "70%", "margin": "18px auto 14px auto", "backgroundColor": BRADESCO_RED, "borderRadius": "999px"}),
                 html.Div(
-                    "Portfolio Solutions | Data as of May 21, 2026 | Confidential",
-                    style={"textAlign": "center", "fontSize": "13px", "color": GRAY, "fontStyle": "italic"},
+                    dcc.Graph(figure=fig_sub_asset, config={"displayModeBar": False}),
+                    style={**panel_style, "flex": "1"},
                 ),
-            ]
+                html.Div(
+                    dcc.Graph(figure=fig_sub_asset_donut, config={"displayModeBar": False}),
+                    style={**panel_style, "flex": "1"},
+                ),
+            ],
+            style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "20px", "marginBottom": "20px"},
         ),
+   # Row 6 - Underlying Concentration
+        html.Div(
+            [
+                html.Div(
+                    dcc.Graph(figure=fig_underlying, config={"displayModeBar": False}),
+                    style={**panel_style, "flex": "3"},
+                ),
+                html.Div(
+                    dcc.Graph(figure=fig_und_donut, config={"displayModeBar": False}),
+                    style={**panel_style, "flex": "2"},
+                ),
+            ],
+            style={
+                "display": "grid",
+                "gridTemplateColumns": "3fr 2fr",
+                "gap": "20px",
+                "marginBottom": "20px",
+            },
+        ),
+            # Footer
+        
+
+html.Div(
+    [
+        html.Div(
+            style={
+                "height": "4px",
+                "width": "70%",
+                "margin": "18px auto 14px auto",
+                "backgroundColor": BRADESCO_RED,
+                "borderRadius": "999px",
+            }
+        ),
+        html.Div(
+            f"Portfolio Solutions | Data as of {today} | Confidential",
+            style={
+                "textAlign": "center",
+                "fontSize": "13px",
+                "color": GRAY,
+                "fontStyle": "italic",
+            },
+        ),
+    ]
+),
     ],
 )
 
